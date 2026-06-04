@@ -1,3 +1,6 @@
+default:
+    just --list
+
 # Launch JupyterLab
 lab:
     uv run jupyter lab
@@ -9,3 +12,7 @@ run notebook:
 # Add a package (usage: just add cvxpy)
 add package:
     uv add {{package}}
+
+# Launch the MutationEngine GUI notebook
+mutate:
+    uv run jupyter lab lessons/backtesting/03_mutation_engine.ipynb
