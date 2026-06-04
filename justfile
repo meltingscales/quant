@@ -13,6 +13,10 @@ run notebook:
 add package:
     uv add {{package}}
 
-# Launch the MutationEngine GUI notebook
+# Launch the MutationEngine GUI notebook (ipywidgets, runs in Jupyter)
 mutate:
     uv run jupyter lab lessons/backtesting/03_mutation_engine.ipynb
+
+# Launch the standalone Tkinter MutationEngine GUI (requires: sudo pacman -S tk)
+gui:
+    uv run python DrakonixBacktester/mutationengine/tkgui.py
