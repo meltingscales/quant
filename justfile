@@ -20,3 +20,7 @@ mutate:
 # Launch the standalone Tkinter MutationEngine GUI (requires: sudo pacman -S tk)
 gui:
     uv run python DrakonixBacktester/mutationengine/tkgui.py
+
+# Run the autonomous strategy discovery daemon (Ctrl+C to stop gracefully)
+daemon:
+    uv run python DrakonixBacktester/mutationengine/daemon.py

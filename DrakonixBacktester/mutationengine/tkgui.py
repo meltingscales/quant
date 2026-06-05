@@ -37,6 +37,8 @@ from DrakonixBacktester.mutationengine.engine import (
 )
 from DrakonixBacktester.engine import Backtester
 from DrakonixBacktester import metrics as m
+from DrakonixBacktester.store import StrategyStore
+from DrakonixBacktester.store.db import DEFAULT_DB_PATH
 
 
 # ── constants ────────────────────────────────────────────────────────────────
@@ -135,6 +137,12 @@ class DrakonixTkGUI:
         self._queue: queue.Queue = queue.Queue()
         self._grow_gen: int = 0
         self._all_records: list[dict] = []   # accumulated across grow generations
+        self._run_id: int | None = None
+
+        # ── DB ──
+        self._store = StrategyStore(DEFAULT_DB_PATH)
+        self._db_path_var = tk.StringVar(value=str(DEFAULT_DB_PATH))
+        self._autosave_var = tk.BooleanVar(value=True)
 
         self._build_menu()
         self._build_layout()
@@ -156,6 +164,15 @@ class DrakonixTkGUI:
         eng_m.add_command(label='Clear Results', command=self._clear_results)
         eng_m.add_command(label='Deflated Sharpe…', command=self._show_deflated_sharpe)
         bar.add_cascade(label='Engine', menu=eng_m)
+
+        db_m = tk.Menu(bar, tearoff=False)
+        db_m.add_command(label='DB Stats…',            command=self._show_db_stats)
+        db_m.add_command(label='Load Top from DB',      command=self._load_from_db)
+        db_m.add_command(label='Save Current to DB',    command=self._save_to_db)
+        db_m.add_separator()
+        db_m.add_command(label='Decay Report…',         command=self._show_decay_report)
+        db_m.add_command(label='Change DB Path…',       command=self._change_db_path)
+        bar.add_cascade(label='Database', menu=db_m)
 
         bar.add_command(label='About', command=lambda: messagebox.showinfo(
             'About',
@@ -268,6 +285,23 @@ class DrakonixTkGUI:
         self._stat_best = tk.StringVar(value='Best Sharpe: —')
         for var in (self._stat_gen, self._stat_eval, self._stat_best):
             ttk.Label(f, textvariable=var, font=('', 9)).pack(anchor='w', padx=10)
+
+        ttk.Separator(f, orient='horizontal').pack(fill=tk.X, pady=5)
+
+        # Database
+        ttk.Label(f, text='Database', font=('', 10, 'bold')).pack(anchor='w', **PAD)
+        self._stat_db = tk.StringVar(value='DB: —')
+        ttk.Label(f, textvariable=self._stat_db, font=('', 9),
+                  foreground='gray').pack(anchor='w', padx=10)
+        ttk.Checkbutton(f, text='Auto-save to DB', variable=self._autosave_var).pack(
+            anchor='w', padx=10, pady=2)
+        db_btns = ttk.Frame(f)
+        db_btns.pack(fill=tk.X, padx=8, pady=2)
+        ttk.Button(db_btns, text='Load from DB', command=self._load_from_db).pack(
+            side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        ttk.Button(db_btns, text='DB Stats', command=self._show_db_stats).pack(
+            side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        self._refresh_db_stat()
 
     # ── right: results + charts ──────────────────────────────────────────────
 
@@ -423,6 +457,9 @@ class DrakonixTkGUI:
         self._engine = self._make_engine()
         self._all_records = []
         self._grow_gen = 0
+        config = {'start': self._start_var.get(), 'end': self._end_var.get(),
+                  'fitness': self._fitness_var.get()}
+        self._run_id = self._store.begin_run(config) if self._autosave_var.get() else None
         self._thread = threading.Thread(
             target=self._run_thread, args=(self._gen_var.get(),), daemon=True)
         self._thread.start()
@@ -434,6 +471,10 @@ class DrakonixTkGUI:
         self._stop_event.clear()
         if self._engine is None:
             self._engine = self._make_engine()
+        if self._run_id is None and self._autosave_var.get():
+            config = {'start': self._start_var.get(), 'end': self._end_var.get(),
+                      'fitness': self._fitness_var.get(), 'mode': 'grow'}
+            self._run_id = self._store.begin_run(config)
         self._thread = threading.Thread(target=self._grow_thread, daemon=True)
         self._thread.start()
         self._start_spinner('Growing…')
@@ -453,6 +494,12 @@ class DrakonixTkGUI:
                 top_k=self._topk_var.get(),
             )
             self._all_records = df.to_dict('records')
+            if self._autosave_var.get() and self._run_id is not None and not df.empty:
+                saved = self._store.save_generation(
+                    self._run_id, generations, df,
+                    self._start_var.get(), self._end_var.get())
+                self._store.end_run(self._run_id)
+                self._queue.put(('db_saved', saved))
             self._queue.put(('results', df))
             self._queue.put(('status', f'Done — {len(df)} individuals evaluated.'))
         except Exception as exc:
@@ -523,6 +570,13 @@ class DrakonixTkGUI:
 
                 self._queue.put(('results', df))
                 self._queue.put(('gen',     gen))
+
+                if self._autosave_var.get() and self._run_id is not None and records:
+                    gen_df = pd.DataFrame(records)
+                    saved = self._store.save_generation(
+                        self._run_id, gen, gen_df,
+                        self._engine.start, self._engine.end)
+                    self._queue.put(('db_saved', saved))
 
                 population = _survivors_to_population(self._all_records)
 
@@ -608,6 +662,11 @@ class DrakonixTkGUI:
                     self._render_cross(*data)
                 elif msg == 'error':
                     messagebox.showerror('Engine Error', data)
+                elif msg == 'done':
+                    self._progress.stop()
+                    self._refresh_db_stat()
+                elif msg == 'db_saved':
+                    self._refresh_db_stat()
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
@@ -848,6 +907,115 @@ class DrakonixTkGUI:
             cols = [c for c in self._results.columns if c not in drop]
             self._results[cols].to_csv(path, index=False)
             self._status_var.set(f'Exported → {path}')
+
+    # ── database methods ─────────────────────────────────────────────────────
+
+    def _refresh_db_stat(self):
+        try:
+            s = self._store.stats()
+            n = s.get('total_evaluations', 0)
+            best = s.get('best_fitness')
+            best_str = f'{best:.2f}' if isinstance(best, float) else '—'
+            self._stat_db.set(f'DB: {n:,} strategies  |  best: {best_str}')
+        except Exception:
+            self._stat_db.set('DB: unavailable')
+
+    def _show_db_stats(self):
+        try:
+            s = self._store.stats()
+            msg = (
+                f"Database: {self._store.db_path}\n\n"
+                f"Total evaluations: {s.get('total_evaluations', 0):,}\n"
+                f"Completed runs:    {s.get('completed_runs', 0)}\n"
+                f"Best fitness:      {s.get('best_fitness', '—')}\n"
+                f"Best ticker:       {s.get('best_ticker', '—')}\n"
+                f"Best strategy:     {s.get('best_strategy', '—')}\n"
+                f"Last run at:       {s.get('last_run_at', '—')}"
+            )
+            messagebox.showinfo('Database Stats', msg)
+        except Exception as exc:
+            messagebox.showerror('DB Error', str(exc))
+
+    def _load_from_db(self):
+        try:
+            df = self._store.top_survivors(n=100)
+            if df.empty:
+                messagebox.showinfo('Empty DB', 'No strategies in the database yet. Run the engine first.')
+                return
+            # Add display columns expected by the table (no _result — DB rows have no equity curve)
+            df['sharpe'] = df['fitness']
+            df['total_return'] = df.get('total_return', '—')
+            df['max_drawdown'] = df.get('max_drawdown', '—')
+            df['cagr'] = df.get('cagr', '—')
+            df['n_trades'] = df.get('n_trades', '—')
+            df['generation'] = 'DB'
+            df['_score'] = df['fitness']
+            df['_result'] = None
+            self._results = df.reset_index(drop=True)
+            self._refresh_table(self._results)
+            self._refresh_stats(self._results)
+            self._status_var.set(f'Loaded {len(df)} strategies from DB.')
+        except Exception as exc:
+            messagebox.showerror('DB Error', str(exc))
+
+    def _save_to_db(self):
+        if self._results.empty:
+            messagebox.showinfo('No results', 'Run the engine first.')
+            return
+        try:
+            run_id = self._store.begin_run({'source': 'manual_save'})
+            saved = self._store.save_generation(
+                run_id, 0, self._results,
+                self._start_var.get(), self._end_var.get())
+            self._store.end_run(run_id)
+            self._refresh_db_stat()
+            self._status_var.set(f'Saved {saved} strategies to DB.')
+        except Exception as exc:
+            messagebox.showerror('DB Error', str(exc))
+
+    def _show_decay_report(self):
+        try:
+            df = self._store.decay_report(top_n=20)
+            if df.empty:
+                messagebox.showinfo('No decay data',
+                    'No decay checks yet. Run the daemon with --decay-interval to collect them.')
+                return
+            win = tk.Toplevel(self.root)
+            win.title('Strategy Decay Report')
+            win.geometry('900x400')
+            cols = ['ticker', 'strategy', 'original_sharpe', 'decay_sharpe',
+                    'sharpe_delta', 'window_start', 'window_end']
+            tv = ttk.Treeview(win, columns=cols, show='headings')
+            for col in cols:
+                tv.heading(col, text=col.replace('_', ' ').title())
+                tv.column(col, width=110, anchor='center')
+            vsb = ttk.Scrollbar(win, orient='vertical', command=tv.yview)
+            tv.configure(yscrollcommand=vsb.set)
+            vsb.pack(side=tk.RIGHT, fill=tk.Y)
+            tv.pack(fill=tk.BOTH, expand=True)
+            for _, row in df.iterrows():
+                delta = row.get('sharpe_delta')
+                tag = 'decay' if isinstance(delta, float) and delta < -0.3 else ''
+                tv.insert('', 'end', tags=(tag,), values=tuple(
+                    f'{row.get(c, "—"):.3f}' if isinstance(row.get(c), float) else row.get(c, '—')
+                    for c in cols))
+            tv.tag_configure('decay', foreground='red')
+        except Exception as exc:
+            messagebox.showerror('DB Error', str(exc))
+
+    def _change_db_path(self):
+        from tkinter.filedialog import asksaveasfilename
+        path = asksaveasfilename(
+            defaultextension='.db',
+            filetypes=[('SQLite DB', '*.db'), ('All files', '*')],
+            title='Choose or create database file',
+            initialfile='strategies.db',
+        )
+        if path:
+            self._store = StrategyStore(path)
+            self._db_path_var.set(path)
+            self._refresh_db_stat()
+            self._status_var.set(f'Database: {path}')
 
     def _clear_results(self):
         self._results    = pd.DataFrame()
